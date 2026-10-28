@@ -1229,6 +1229,17 @@ func (s *service) NodePublishVolume(
 			return nil, status.Errorf(codes.FailedPrecondition, "could not create target path '%s': %v", targetPath, err)
 		}
 
+		// NodePublishVolume must be idempotent: a retry on a target that is
+		// already published must not stack a second bind mount on it.
+		isMounted, err := getIsVolumeMounted(ctx, volName, targetPath)
+		if err != nil {
+			return nil, err
+		}
+		if isMounted {
+			csmlog.WithContext(ctx).WithFields(publishFields).Info("NodePublishVolume: target already published")
+			return &csi.NodePublishVolumeResponse{}, nil
+		}
+
 		// Perform bind-mount with correct options
 		mountFunc := getMountFunc()
 		if err := mountFunc(ctx, stagingPath, targetPath, "", mntOptions...); err != nil {

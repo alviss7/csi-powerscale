@@ -393,13 +393,13 @@ func Test_unpublishVolume(t *testing.T) {
 	defaultGetGetMountsFunc := getGetMountsFunc
 	defaultGetMountFunc := getMountFunc
 	defaultGetUnmountFunc := getUnmountFunc
-	defaultGetOsRemoveAllFunc := getOsRemoveAllFunc
+	defaultGetOsRemoveFunc := getOsRemoveFunc
 
 	after := func() {
 		getGetMountsFunc = defaultGetGetMountsFunc
 		getMountFunc = defaultGetMountFunc
 		getUnmountFunc = defaultGetUnmountFunc
-		getOsRemoveAllFunc = defaultGetOsRemoveAllFunc
+		getOsRemoveFunc = defaultGetOsRemoveFunc
 	}
 
 	type args struct {
@@ -408,13 +408,13 @@ func Test_unpublishVolume(t *testing.T) {
 		filterStr string
 	}
 	tests := []struct {
-		name               string
-		getGetMountsFunc   func() func(ctx context.Context) ([]gofsutil.Info, error)
-		getMountFunc       func() func(ctx context.Context, source, target, fsType string, opts ...string) error
-		getUnmountFunc     func() func(ctx context.Context, target string) error
-		getOsRemoveAllFunc func() func(path string) error
-		args               args
-		wantErr            bool
+		name             string
+		getGetMountsFunc func() func(ctx context.Context) ([]gofsutil.Info, error)
+		getMountFunc     func() func(ctx context.Context, source, target, fsType string, opts ...string) error
+		getUnmountFunc   func() func(ctx context.Context, target string) error
+		getOsRemoveFunc  func() func(path string) error
+		args             args
+		wantErr          bool
 	}{
 		{
 			name: "empty request",
@@ -486,23 +486,12 @@ func Test_unpublishVolume(t *testing.T) {
 		{
 			name: "successful unmount",
 			getGetMountsFunc: func() func(ctx context.Context) ([]gofsutil.Info, error) {
-				return func(_ context.Context) ([]gofsutil.Info, error) {
-					mounts := []gofsutil.Info{
-						{
-							Path:   "/data1",
-							Opts:   []string{"rw", "remount"},
-							Device: "testdata1",
-						},
-					}
-					return mounts, nil
-				}
+				return fakeMountTable.getMounts
 			},
 			getUnmountFunc: func() func(ctx context.Context, target string) error {
-				return func(_ context.Context, _ string) error {
-					return nil
-				}
+				return fakeMountTable.unmount
 			},
-			getOsRemoveAllFunc: func() func(path string) error {
+			getOsRemoveFunc: func() func(path string) error {
 				return func(_ string) error {
 					return nil
 				}
@@ -520,23 +509,12 @@ func Test_unpublishVolume(t *testing.T) {
 		{
 			name: "cleanup fails after unmount",
 			getGetMountsFunc: func() func(ctx context.Context) ([]gofsutil.Info, error) {
-				return func(_ context.Context) ([]gofsutil.Info, error) {
-					mounts := []gofsutil.Info{
-						{
-							Path:   "/data1",
-							Opts:   []string{"rw", "remount"},
-							Device: "testdata1",
-						},
-					}
-					return mounts, nil
-				}
+				return fakeMountTable.getMounts
 			},
 			getUnmountFunc: func() func(ctx context.Context, target string) error {
-				return func(_ context.Context, _ string) error {
-					return nil
-				}
+				return fakeMountTable.unmount
 			},
-			getOsRemoveAllFunc: func() func(path string) error {
+			getOsRemoveFunc: func() func(path string) error {
 				return func(_ string) error {
 					return fmt.Errorf("injected error for unit test")
 				}
@@ -557,6 +535,7 @@ func Test_unpublishVolume(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			defer after()
 
+			fakeMountTable = newFakeMountTable("/data1", "testdata1", 1)
 			if tt.getGetMountsFunc != nil {
 				getGetMountsFunc = tt.getGetMountsFunc
 			}
@@ -569,8 +548,8 @@ func Test_unpublishVolume(t *testing.T) {
 				getUnmountFunc = tt.getUnmountFunc
 			}
 
-			if tt.getOsRemoveAllFunc != nil {
-				getOsRemoveAllFunc = tt.getOsRemoveAllFunc
+			if tt.getOsRemoveFunc != nil {
+				getOsRemoveFunc = tt.getOsRemoveFunc
 			}
 
 			if err := unpublishVolume(tt.args.ctx, tt.args.req, tt.args.filterStr); (err != nil) != tt.wantErr {
@@ -1210,5 +1189,127 @@ func Test_publishVolume_mTLS_xprtsec_injection(t *testing.T) {
 			// Never duplicate
 			assert.LessOrEqual(t, xprtsecCount, 1, "xprtsec=mtls must not be duplicated, count=%d opts=%v", xprtsecCount, capturedOpts)
 		})
+	}
+}
+
+// fakeMountTable is a mount table where one target can carry several stacked
+// mounts of the same device, and each unmount removes the top one, like
+// umount(2) does.
+type fakeMountTableT struct {
+	target   string
+	device   string
+	layers   int
+	unmounts int
+}
+
+var fakeMountTable *fakeMountTableT
+
+func newFakeMountTable(target, device string, layers int) *fakeMountTableT {
+	return &fakeMountTableT{target: target, device: device, layers: layers}
+}
+
+func (f *fakeMountTableT) getMounts(_ context.Context) ([]gofsutil.Info, error) {
+	mounts := []gofsutil.Info{}
+	for i := 0; i < f.layers; i++ {
+		mounts = append(mounts, gofsutil.Info{Path: f.target, Device: f.device, Opts: []string{"rw"}})
+	}
+	return mounts, nil
+}
+
+func (f *fakeMountTableT) unmount(_ context.Context, target string) error {
+	if target == f.target && f.layers > 0 {
+		f.layers--
+	}
+	f.unmounts++
+	return nil
+}
+
+// A target with stacked mounts (a NodePublishVolume retried on an already
+// published target) must be fully unmounted before it is removed. Removing it
+// while it is still a mount point deletes the content of the NFS export.
+func Test_unpublishVolume_StackedMounts(t *testing.T) {
+	defaultGetGetMountsFunc := getGetMountsFunc
+	defaultGetUnmountFunc := getUnmountFunc
+	defaultGetOsRemoveFunc := getOsRemoveFunc
+	defer func() {
+		getGetMountsFunc = defaultGetGetMountsFunc
+		getUnmountFunc = defaultGetUnmountFunc
+		getOsRemoveFunc = defaultGetOsRemoveFunc
+	}()
+
+	table := newFakeMountTable("/data1", "10.0.0.1:/ifs/data/csi/k8s-testdata1", 3)
+	getGetMountsFunc = func() func(ctx context.Context) ([]gofsutil.Info, error) { return table.getMounts }
+	getUnmountFunc = func() func(ctx context.Context, target string) error { return table.unmount }
+	removed := 0
+	getOsRemoveFunc = func() func(path string) error {
+		return func(_ string) error {
+			if table.layers > 0 {
+				t.Fatalf("target removed while %d mount(s) are still on it", table.layers)
+			}
+			removed++
+			return nil
+		}
+	}
+
+	req := &csi.NodeUnpublishVolumeRequest{VolumeId: "k8s-testdata1", TargetPath: "/data1"}
+	if err := unpublishVolume(context.Background(), req, "k8s-testdata1"); err != nil {
+		t.Fatalf("unpublishVolume() error = %v", err)
+	}
+	if table.unmounts != 3 || table.layers != 0 || removed != 1 {
+		t.Errorf("unmounts = %d, layers left = %d, removes = %d; want 3, 0, 1", table.unmounts, table.layers, removed)
+	}
+}
+
+// If the target is still mounted after maxUnmountLayers unmounts, give up
+// without removing anything.
+func Test_unpublishVolume_StillMounted(t *testing.T) {
+	defaultGetGetMountsFunc := getGetMountsFunc
+	defaultGetUnmountFunc := getUnmountFunc
+	defaultGetOsRemoveFunc := getOsRemoveFunc
+	defer func() {
+		getGetMountsFunc = defaultGetGetMountsFunc
+		getUnmountFunc = defaultGetUnmountFunc
+		getOsRemoveFunc = defaultGetOsRemoveFunc
+	}()
+
+	table := newFakeMountTable("/data1", "testdata1", 1)
+	getGetMountsFunc = func() func(ctx context.Context) ([]gofsutil.Info, error) { return table.getMounts }
+	getUnmountFunc = func() func(ctx context.Context, target string) error {
+		return func(_ context.Context, _ string) error {
+			table.unmounts++
+			return nil
+		}
+	}
+	getOsRemoveFunc = func() func(path string) error {
+		return func(_ string) error {
+			t.Fatal("target removed while it is still mounted")
+			return nil
+		}
+	}
+
+	req := &csi.NodeUnpublishVolumeRequest{VolumeId: "testdata1", TargetPath: "/data1"}
+	if err := unpublishVolume(context.Background(), req, "testdata1"); err == nil {
+		t.Fatal("unpublishVolume() succeeded on a target that stays mounted")
+	}
+	if table.unmounts != maxUnmountLayers {
+		t.Errorf("unmounts = %d, want %d", table.unmounts, maxUnmountLayers)
+	}
+}
+
+// The default removal used after unmount must never recurse into the target.
+func Test_getOsRemoveFunc_NotRecursive(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "mount")
+	if err := os.MkdirAll(filepath.Join(target, "eventattachments", "v1"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(target, "eventattachments", "v1", "e001")
+	if err := os.WriteFile(file, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := getOsRemoveFunc()(target); err == nil {
+		t.Error("removing a non-empty target succeeded")
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Errorf("file inside the target was deleted: %v", err)
 	}
 }

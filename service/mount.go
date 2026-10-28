@@ -51,8 +51,8 @@ var (
 		return gofsutil.Unmount
 	}
 
-	getOsRemoveAllFunc = func() func(name string) error {
-		return os.RemoveAll
+	getOsRemoveFunc = func() func(name string) error {
+		return os.Remove
 	}
 
 	recordAuthFailureFunc = func() {
@@ -191,6 +191,9 @@ var (
 )
 
 // unpublishVolume removes the mount to the target path
+// maxUnmountLayers bounds the unmount loop of unpublishVolume.
+const maxUnmountLayers = 32
+
 func unpublishVolume(
 	ctx context.Context,
 	req *csi.NodeUnpublishVolumeRequest, filterStr string,
@@ -209,14 +212,30 @@ func unpublishVolume(
 	if !isMounted {
 		return nil
 	}
-	if err := getUnmountFunc()(context.Background(), target); err != nil {
-		return status.Errorf(codes.Internal,
-			"error unmounting target '%s': '%s'", target, err.Error())
+
+	// A target can carry several stacked mounts of the same export, for
+	// example after a NodePublishVolume retried on an already published
+	// target. One umount only removes the top one: unmount until nothing of
+	// the volume is mounted there any more.
+	for layers := 0; isMounted; layers++ {
+		if layers == maxUnmountLayers {
+			return status.Errorf(codes.Internal,
+				"target '%s' is still mounted after %d unmounts", target, layers)
+		}
+		if err := getUnmountFunc()(context.Background(), target); err != nil {
+			return status.Errorf(codes.Internal,
+				"error unmounting target '%s': '%s'", target, err.Error())
+		}
+		if isMounted, err = isVolumeMounted(ctx, filterStr, target); err != nil {
+			return err
+		}
 	}
 	csmlog.WithContext(ctx).Debugf("unmounting '%s' succeeded", target)
 
-	// Remove the target path after unmounting
-	if err := getOsRemoveAllFunc()(target); err != nil {
+	// The target is now an empty mount point. Never remove it recursively:
+	// if something is still mounted on it, a recursive removal walks into the
+	// NFS export and deletes its content. os.Remove fails with EBUSY instead.
+	if err := getOsRemoveFunc()(target); err != nil && !os.IsNotExist(err) {
 		return status.Errorf(codes.Internal,
 			"error removing target path '%s': '%s'", target, err.Error())
 	}

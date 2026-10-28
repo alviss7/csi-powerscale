@@ -1974,11 +1974,11 @@ func TestNodeUnstageVolume_Success(t *testing.T) {
 	}
 	oldUnmountFunc := getUnmountFunc
 	oldGetMountsFunc := getGetMountsFunc
-	oldOsRemoveAllFunc := getOsRemoveAllFunc
+	oldOsRemoveAllFunc := getOsRemoveFunc
 	defer func() {
 		getUnmountFunc = oldUnmountFunc
 		getGetMountsFunc = oldGetMountsFunc
-		getOsRemoveAllFunc = oldOsRemoveAllFunc
+		getOsRemoveFunc = oldOsRemoveAllFunc
 	}()
 	getGetMountsFunc = func() func(ctx context.Context) ([]gofsutil.Info, error) {
 		return func(_ context.Context) ([]gofsutil.Info, error) {
@@ -1987,7 +1987,7 @@ func TestNodeUnstageVolume_Success(t *testing.T) {
 			}, nil
 		}
 	}
-	getOsRemoveAllFunc = func() func(path string) error {
+	getOsRemoveFunc = func() func(path string) error {
 		return func(_ string) error { return nil }
 	}
 	unmountCalled := false
@@ -2069,6 +2069,64 @@ func TestNodePublishVolume_BindMount(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.True(t, bindMountCalled)
+}
+
+// A NodePublishVolume retried on a target that is already published must not
+// stack a second bind mount on it.
+func TestNodePublishVolume_BindMount_AlreadyPublished(t *testing.T) {
+	ctx := context.Background()
+	isiClusters := new(sync.Map)
+	testIsilonClusterConfig := IsilonClusterConfig{
+		ClusterName: "cluster1",
+		Endpoint:    "http://testendpoint",
+		EndpointURL: "http://endpointurl",
+		accessZone:  "System",
+		User:        "testuser",
+		Password:    "testpassword",
+		isiSvc:      &isiService{},
+	}
+	isiClusters.Store("cluster1", &testIsilonClusterConfig)
+	svc := &service{
+		opts:        Opts{},
+		isiClusters: isiClusters,
+	}
+
+	stagingPath := filepath.Join(t.TempDir(), "staging-vol-444")
+	targetPath := filepath.Join(t.TempDir(), "target-vol-444")
+
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-444=_=_=100=_=_=System=_=_=cluster1=_=_=directory",
+		StagingTargetPath: stagingPath,
+		TargetPath:        targetPath,
+		VolumeCapability:  &csi.VolumeCapability{AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}}},
+		VolumeContext: map[string]string{
+			"ProvisioningMode": "directory",
+			"SharedExportPath": "/ifs/k8s/shared",
+			"DirectoryPath":    "vol-444",
+			"ClusterName":      "cluster1",
+		},
+	}
+	oldGetVolByNameFunc := getVolByNameFunc
+	defer func() { getVolByNameFunc = oldGetVolByNameFunc }()
+	getVolByNameFunc = func(_ *service, _ context.Context, _, _ string, _ *IsilonClusterConfig) (isi.Volume, error) {
+		return nil, nil
+	}
+	oldGetIsVolumeMounted := getIsVolumeMounted
+	defer func() { getIsVolumeMounted = oldGetIsVolumeMounted }()
+	getIsVolumeMounted = func(_ context.Context, _ string, target string) (bool, error) {
+		return target == targetPath, nil
+	}
+	oldMountFunc := getMountFunc
+	defer func() { getMountFunc = oldMountFunc }()
+	getMountFunc = func() func(ctx context.Context, source, target, fsType string, opts ...string) error {
+		return func(_ context.Context, _, _, _ string, _ ...string) error {
+			t.Error("bind mount stacked on an already published target")
+			return nil
+		}
+	}
+	resp, err := svc.NodePublishVolume(ctx, req)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
 }
 
 // Additional NodeStageVolume tests for coverage
